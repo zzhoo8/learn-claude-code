@@ -23,9 +23,14 @@ This is the core loop: feed tool results back to the model
 until the model decides to stop. Production agents layer
 policy, hooks, and lifecycle controls on top.
 """
-
+import asyncio
 import os
 import subprocess
+
+from agentscope.formatter import OpenAIChatFormatter
+from agentscope.message import Msg, TextBlock
+from agentscope.model import OpenAIChatModel, ChatResponse
+from agentscope.tool import ToolResponse
 
 try:
     import readline
@@ -46,8 +51,24 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+# client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# MODEL = os.environ["MODEL_ID"]
+
+# 支持 agentscope
+from agents import config
+client = OpenAIChatModel(
+    model_name=config.Config.OPENAI_CONFIG.get('model'),
+    api_key=config.Config.OPENAI_CONFIG.get('api_key'),
+    client_kwargs={
+        'base_url': config.Config.OPENAI_CONFIG.get('api_base'),
+    },
+    generate_kwargs={
+        'temperature': 0.01,
+        'max_tokens': 4096
+    },
+    stream=False,
+)
+
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
@@ -76,27 +97,61 @@ def run_bash(command: str) -> str:
 
 
 # -- The core pattern: a while loop that calls tools until the model stops --
-def agent_loop(messages: list):
+async def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        # response = client.messages.create(
+        #     model=MODEL, system=SYSTEM, messages=messages,
+        #     tools=TOOLS, max_tokens=8000,
+        # )
+        # 支持 agentscope
+        _msgs = [Msg(name='', role=message.get('role'), content=message.get('content')) for message in messages]
+        _formatter = OpenAIChatFormatter()
+        _prompt = await _formatter.format(msgs=[
+            # 系统提示词总在最前
+            Msg(name="系统", role="system", content=SYSTEM),
+            *_msgs
+        ])
+        response: ChatResponse = await client(
+            messages=_prompt,
+            tools=TOOLS,
         )
+        if len(response.content) < 2:
+            return
+        _content = response.content[1]
         # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
+        # messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "assistant", "content": [_content]})
         # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        # if response.stop_reason != "tool_use":
+        #     return
+        if _content.get('type') != 'tool_use':
             return
         # Execute each tool call, collect results
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
+        # results = []
+        # for block in response.content:
+        #     if block.type == "tool_use":
+        #         print(f"\033[33m$ {block.input['command']}\033[0m")
+        #         output = run_bash(block.input["command"])
+        #         print(output[:200])
+        #         results.append({"type": "tool_result", "tool_use_id": block.id,
+        #                         "content": output})
+        _input: dict = _content.get('input')
+        print(_input)
+        output: str = run_bash(command=_input.get('command'))
+        print(output)
+        # tool_response = ToolResponse(
+        #     TextBlock(
+        #         type="text",
+        #         text=output,
+        #     ),
+        # )
+        # tool_response.content
+        result = {
+            "type": "tool_result",
+            "tool_use_id": _content.get('id'),
+            "output": output,
+        }
+        messages.append({"role": "user", "content": [result]})
 
 
 if __name__ == "__main__":
@@ -109,7 +164,7 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        asyncio.run(agent_loop(messages=history))
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
